@@ -1,6 +1,6 @@
 # MCP 服务治理引擎 (MCP Governance)
 
-基于 [Rajomon](https://arxiv.org/abs/2304.12224) 动态定价思想，将过载控制应用于 **MCP (Model Context Protocol)** 工具调用场景的服务治理框架。
+动态定价思想，将过载控制应用于 **MCP (Model Context Protocol)** 工具调用场景的服务治理框架。
 
 ## 核心思想
 
