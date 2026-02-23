@@ -72,7 +72,7 @@ func (gov *MCPGovernor) RetrieveDSPrice(ctx context.Context, methodName string) 
 }
 
 // RetrieveTotalPrice 计算总价格（自身价格 + 下游价格）
-// 这是 Rajomon 的核心定价逻辑，根据配置的 priceAggregation 策略进行计算
+// 这是 mcpgateway 的核心定价逻辑，根据配置的 priceAggregation 策略进行计算
 func (gov *MCPGovernor) RetrieveTotalPrice(ctx context.Context, methodName string) (string, error) {
 	ownPrice_string, _ := gov.priceTableMap.Load("ownprice")
 	ownPrice := ownPrice_string.(int64)
