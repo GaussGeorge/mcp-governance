@@ -40,6 +40,7 @@
 | `rate_limiting_test.go` | **客户端限流 (Rate Limiting) 效果测试**。验证令牌扣除逻辑、固定速率令牌补充、令牌添加、并发令牌操作安全性、客户端中间件 `_meta` 注入、限流阻止低令牌请求、退避机制、`RateLimiting` 方法直接测试、客户端限流 + 服务端负载削减联动端到端测试、`UpdateResponsePrice` 价格缓存更新。 |
 | `dynamic_pricing_test.go` | **动态定价 (Dynamic Pricing) 效果测试**。验证 Step 策略（拥塞涨价 / 非拥塞降价 / 价格不为负）、指导价格 (guidePrice) 机制、指数衰减策略（抑制震荡 / 衰减计数器重置）、底价 (Reserve Price) 保护、过载→恢复完整周期端到端测试、下游价格传播 (Maximal / Additive / Mean 三种聚合策略)。 |
 | `e2e_governance_test.go` | **端到端服务治理集成测试**。模拟真实 MCP 场景：多工具链路治理（网关 → 天气服务 + 酒店服务，价格传播与聚合）、令牌分配 (`SplitTokens` 测试)、渐进式过载（逐步提高并发度观察拒绝率）、脉冲式突发流量（交替高峰/低谷）、预算公平性测试（高预算优先通过）、`HandleToolCallDirect` 直接调用模式、长时间运行稳定性测试 (10秒持续负载)、价格元信息往返 (Request→Response→ClientCache 完整链路)。 |
+| `poisson_burst_test.go` | **泊松突发流量压力测试**。基于泊松过程 (Poisson Process) 建模真实不均匀流量，覆盖两条过载检测路径：`throughputCheck`（吞吐量驱动）和 `queuingCheck`（排队延迟驱动，配合 `GOMAXPROCS(2)` 制造调度瓶颈）。包含六大测试场景：吞吐量驱动泊松到达（不同 λ 下拒绝率从 0% 到 91%）、排队延迟驱动（`GOMAXPROCS=2` + CPU 忙等）、非齐次泊松过程 NHPP（λ 随时间变化：正常→爬升→峰值→骤降→恢复）、复合泊松突发（外层突发事件 + 内层批量请求，模拟 AI Agent 并行工具调用）、突发振幅对比（固定等效 RPS 下不同聚集程度的治理效果差异）、客户端泊松令牌补充（双重随机系统：`tokenRefillDist="poisson"` + 泊松请求到达）。同时提供了公共辅助函数 (`busyWork`, `poissonSender`, `poissonSample`, `busyHandler`, `makeThroughputOpts`, `makeQueuingOpts`) 供泊松测试使用。 |
 
 ## 环境要求
 
@@ -82,6 +83,9 @@ go test ./mcp_test/ -v -run "TestDynamicPricing"
 
 # --- 端到端集成测试 ---
 go test ./mcp_test/ -v -run "TestE2E"
+
+# --- 泊松突发流量压力测试 ---
+go test ./mcp_test/ -v -run "TestPoisson" -timeout 2m
 ```
 
 ### 4. 运行单个测试用例
@@ -204,6 +208,18 @@ go test ./... -v -run "Test(LoadShedding_Basic|RateLimiting_Token|DynamicPricing
 | `TestE2E_HandleToolCallDirect` | 直接调用模式 |
 | `TestE2E_LongRunningStability` | 10秒长时间稳定性 |
 | `TestE2E_PriceMetaRoundTrip` | 价格元信息完整往返 |
+
+### 泊松突发流量测试 (`mcp_test/poisson_burst_test.go`)
+
+| 测试函数 | 说明 |
+|---------|------|
+| `TestPoisson_ThroughputDriven` | 吞吐量驱动泊松到达：不同 λ (50/200/500/2000) 下，验证 `throughputCheck` 路径的拒绝率随 λ 递增 (0%→56%→91%) |
+| `TestPoisson_QueuingDriven` | 排队延迟驱动泊松到达：`GOMAXPROCS(2)` + CPU 忙等 (500μs)，验证 `queuingCheck` 路径在调度瓶颈下的涨价与拒绝 |
+| `TestPoisson_VariableRate` | 非齐次泊松过程 (NHPP)：λ 随时间变化 (30→200→1500→50→20)，验证治理引擎对流量变化的动态响应（突发期 85%+ 拒绝 → 恢复期 0%） |
+| `TestPoisson_CompoundBurst` | 复合泊松突发：外层泊松事件 (λ=15/s) + 内层泊松批量 (μ=12)，模拟 AI Agent 并行工具调用，观察价格脉冲轨迹 |
+| `TestPoisson_SpikeAmplitude` | 突发振幅对比：固定等效 RPS≈100，从均匀 (100×1) 到极端突发 (5×20)，验证越突发→峰值价格越高→拒绝率越高 |
+| `TestPoisson_ClientTokenRefill` | 双重随机系统：客户端 `tokenRefillDist="poisson"` 泊松令牌补充 + 服务端泊松流量到达，验证多层限流联动效果 |
+| `TestPoisson_SustainedBurst` | 持续泊松冲击 (λ=1000, 10秒)：验证治理引擎在长时间持续高负载下的稳定性，每秒输出价格与拒绝率快照 |
 
 ## 架构概览
 
