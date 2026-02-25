@@ -42,6 +42,60 @@
 | `e2e_governance_test.go` | **端到端服务治理集成测试**。模拟真实 MCP 场景：多工具链路治理（网关 → 天气服务 + 酒店服务，价格传播与聚合）、令牌分配 (`SplitTokens` 测试)、渐进式过载（逐步提高并发度观察拒绝率）、脉冲式突发流量（交替高峰/低谷）、预算公平性测试（高预算优先通过）、`HandleToolCallDirect` 直接调用模式、长时间运行稳定性测试 (10秒持续负载)、价格元信息往返 (Request→Response→ClientCache 完整链路)。 |
 | `poisson_burst_test.go` | **泊松突发流量压力测试**。基于泊松过程 (Poisson Process) 建模真实不均匀流量，覆盖两条过载检测路径：`throughputCheck`（吞吐量驱动）和 `queuingCheck`（排队延迟驱动，配合 `GOMAXPROCS(2)` 制造调度瓶颈）。包含六大测试场景：吞吐量驱动泊松到达（不同 λ 下拒绝率从 0% 到 91%）、排队延迟驱动（`GOMAXPROCS=2` + CPU 忙等）、非齐次泊松过程 NHPP（λ 随时间变化：正常→爬升→峰值→骤降→恢复）、复合泊松突发（外层突发事件 + 内层批量请求，模拟 AI Agent 并行工具调用）、突发振幅对比（固定等效 RPS 下不同聚集程度的治理效果差异）、客户端泊松令牌补充（双重随机系统：`tokenRefillDist="poisson"` + 泊松请求到达）。同时提供了公共辅助函数 (`busyWork`, `poissonSender`, `poissonSample`, `busyHandler`, `makeThroughputOpts`, `makeQueuingOpts`) 供泊松测试使用。 |
 
+### Agent 场景测试文件 (`agent_test/` 目录)
+
+通过代码模拟 AI Agent 的真实工具调用行为，验证治理引擎在 Agent 场景下的表现。测试框架基于 `SimulatedAgent` 抽象，支持 4 种预算分配策略（Fixed 固定 / EqualSplit 均分 / FrontLoaded 前置 / Adaptive 自适应），可执行链式推理和并发竞争两种模式。
+
+| 文件 | 作用 |
+|------|------|
+| `helpers_test.go` | **Agent 模拟框架（公共基础设施）**。定义 `SimulatedAgent`（含预算、策略、任务队列）、`AgentTask`（工具调用任务，支持依赖关系和重试）、`AgentMetrics`（统计指标）、`TestMetrics`（全局指标收集器，含 Jain 公平性指数）。提供 `ExecuteChain`（依赖链式执行）和 `ExecuteConcurrentCalls`（并发独立调用）两种执行引擎，以及 `runAgentsParallel`（多 Agent 并行启动）、`makeAgents`（批量创建）、`simpleOKHandler` / `slowHandler` / `cpuBusyHandler`（模拟工具处理器）等辅助函数。 |
+| `competition_test.go` | **多 Agent 竞争资源场景测试（7 个场景）**。验证等预算公平性（Jain 指数）、不等预算区分能力（高预算优先）、动态涨价竞争压力、竞争升级（2→5→10→20 Agent 阶梯）、多工具资源隔离、突发竞争（10 Agent 同时涌入）、不同预算策略同台竞技效率对比。 |
+| `budget_test.go` | **Agent 预算管理场景测试（10 个场景）**。验证预算耗尽优雅停止、低/中/高预算完成率分层、4 种策略效率基准、价格阶梯侵蚀预算、自适应 vs 固定策略在价格波动环境下的对比、多 Agent 预算隔离、拒绝退款不膨胀、预算生命周期（长时间消耗曲线）、边界条件（零预算/最小预算/超大预算）、全局令牌总量守恒。 |
+| `reasoning_chain_test.go` | **Agent 多步推理链场景测试（11 个场景）**。模拟 LLM Agent 的 "思考→调工具→思考→调工具" 链式调用模式。验证基础线性链（search→analyze→summarize）、依赖断裂（中间步骤失败→后续跳过）、重试恢复、10 步长链稳定性、链中动态涨价、多 Agent 并行推理链、分支推理（可选步骤不影响主链）、链模式下策略对比、批量实验（N=20 收集统计分布）、竞争+推理链结合（干扰 Agent 对链完成率的影响）、Fan-out/Fan-in 并行分支汇总。 |
+
+#### 多 Agent 竞争资源测试 (`agent_test/competition_test.go`)
+
+| 测试函数 | 说明 |
+|---------|------|
+| `TestCompetition_EqualBudget_Fairness` | 5 个等预算 Agent 竞争同一工具，验证 Jain 公平性指数 > 0.8 |
+| `TestCompetition_UnequalBudget_HighBudgetAdvantage` | 2 高预算 vs 3 低预算 Agent，验证高预算平均成功率更高 |
+| `TestCompetition_DynamicPricing_UnderContention` | 10 Agent 涌入触发动态涨价，验证系统不崩溃且有效吞吐 > 0 |
+| `TestCompetition_Escalation` | 从 2→5→10→20 Agent 逐步升级，观察拒绝率随竞争加剧的变化 |
+| `TestCompetition_MultiTool_ResourceIsolation` | 2 组 Agent 分别竞争 2 个不同工具，验证跨工具负载隔离 |
+| `TestCompetition_BurstArrival` | 10 Agent 同一时刻启动 (sync.WaitGroup)，高频发请求验证稳定性 |
+| `TestCompetition_StrategyComparison` | 4 种策略 Agent 同台竞技，对比成功次数和效率 (成功/千令牌) |
+
+#### Agent 预算管理测试 (`agent_test/budget_test.go`)
+
+| 测试函数 | 说明 |
+|---------|------|
+| `TestBudget_Exhaustion_GracefulStop` | 有限预算持续调用直到耗尽，验证不产生负预算 |
+| `TestBudget_Tiers_CompletionRate` | 低/中/高 3 档预算完成率对比 |
+| `TestBudget_StrategyEfficiency_Benchmark` | Fixed/EqualSplit/FrontLoaded/Adaptive 4 策略效率基准 |
+| `TestBudget_PriceIncrease_BudgetErosion` | 5 阶段价格阶梯 (10→30→50→70→100) 对预算的侵蚀效果 |
+| `TestBudget_Adaptive_vs_Fixed_UnderPriceFluctuation` | 价格波动环境下自适应策略 vs 固定策略对比 |
+| `TestBudget_Isolation_IndependentBudgets` | 3 Agent 独立预算 (50/500/5000)，一个耗尽不影响其他 |
+| `TestBudget_Refund_OnRejection` | 拒绝退款机制验证：退款不导致预算膨胀 |
+| `TestBudget_Lifecycle_LongRunning` | 10 阶段长时间运行，记录预算消耗曲线 |
+| `TestBudget_EdgeCases` | 边界条件：零预算 / 最小预算(刚好一次) / 超大预算 |
+| `TestBudget_Conservation_TotalTokens` | 多 Agent 并发后全局令牌总量守恒验证 |
+
+#### Agent 多步推理链测试 (`agent_test/reasoning_chain_test.go`)
+
+| 测试函数 | 说明 |
+|---------|------|
+| `TestChain_Linear_Basic` | 基础 3 步线性链 (search→analyze→summarize)，低价全部完成 |
+| `TestChain_DependencyBreak` | 高价环境下依赖断裂：前步被拒→后步跳过 |
+| `TestChain_WithRetries` | 对比有重试 vs 无重试的链完成率 |
+| `TestChain_LongChain_Stability` | 10 步长链稳定性，预算充足时全部完成 |
+| `TestChain_DynamicPricing_MidChain` | 5 步链执行中途服务端涨价 (10→80→150) |
+| `TestChain_MultiAgent_ParallelChains` | 5 Agent 同时执行各自 3 步推理链，竞争共享工具 |
+| `TestChain_BranchingWithOptionalSteps` | 可选步骤失败不影响主链完成 |
+| `TestChain_BudgetStrategy_Comparison` | 4 种策略在 5 步推理链上的完成率和效率对比 |
+| `TestChain_BatchExperiment` | N=20 批量实验，收集链完成率、平均步骤数、平均预算消耗统计 |
+| `TestChain_UnderCompetition` | 3 推理链 Agent + 5 干扰 Agent 同时运行，观察链完成率下降 |
+| `TestChain_FanOutFanIn` | Fan-out/Fan-in 模式：init → [3 并行分支] → merge |
+
 ## 环境要求
 
 - **Go**: 1.23.0+
@@ -67,6 +121,9 @@ go test -v
 
 # 只运行 mcp_test/ 目录下的集成测试
 go test ./mcp_test/ -v
+
+# 只运行 agent_test/ 目录下的 Agent 场景测试
+go test ./agent_test/ -v -timeout 2m
 ```
 
 ### 3. 按测试类别运行
@@ -86,6 +143,15 @@ go test ./mcp_test/ -v -run "TestE2E"
 
 # --- 泊松突发流量压力测试 ---
 go test ./mcp_test/ -v -run "TestPoisson" -timeout 2m
+
+# --- Agent 多 Agent 竞争资源测试 ---
+go test ./agent_test/ -v -run "TestCompetition"
+
+# --- Agent 预算管理测试 ---
+go test ./agent_test/ -v -run "TestBudget"
+
+# --- Agent 多步推理链测试 ---
+go test ./agent_test/ -v -run "TestChain"
 ```
 
 ### 4. 运行单个测试用例
