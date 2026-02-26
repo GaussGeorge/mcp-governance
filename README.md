@@ -53,6 +53,73 @@
 | `budget_test.go` | **Agent 预算管理场景测试（10 个场景）**。验证预算耗尽优雅停止、低/中/高预算完成率分层、4 种策略效率基准、价格阶梯侵蚀预算、自适应 vs 固定策略在价格波动环境下的对比、多 Agent 预算隔离、拒绝退款不膨胀、预算生命周期（长时间消耗曲线）、边界条件（零预算/最小预算/超大预算）、全局令牌总量守恒。 |
 | `reasoning_chain_test.go` | **Agent 多步推理链场景测试（11 个场景）**。模拟 LLM Agent 的 "思考→调工具→思考→调工具" 链式调用模式。验证基础线性链（search→analyze→summarize）、依赖断裂（中间步骤失败→后续跳过）、重试恢复、10 步长链稳定性、链中动态涨价、多 Agent 并行推理链、分支推理（可选步骤不影响主链）、链模式下策略对比、批量实验（N=20 收集统计分布）、竞争+推理链结合（干扰 Agent 对链完成率的影响）、Fan-out/Fan-in 并行分支汇总。 |
 
+### 可视化工具 (`visualization/` 目录)
+
+将 `agent_test/` 的测试输出数据转换为 Matplotlib 图表，共生成 **20 张**可视化图表。
+
+| 文件 | 作用 |
+|------|------|
+| `run_and_plot.py` | **主入口** - 支持运行测试+绘图、样例数据预览、从文件解析三种模式 |
+| `parse_test_output.py` | **数据解析器** - 正则提取 `go test -v` 输出中的结构化指标 |
+| `plot_competition.py` | **竞争场景图表** (6 张)：公平性、不等预算、竞争升级、多工具隔离、突发竞争、策略对比 |
+| `plot_budget.py` | **预算场景图表** (7 张)：分层对比、策略基准、价格侵蚀、自适应vs固定、生命周期、边界条件、守恒验证 |
+| `plot_reasoning_chain.py` | **推理链图表** (6 张)：场景总览、重试效果、并行链、策略对比、批量实验、竞争影响 |
+| `plot_dashboard.py` | **综合仪表板** (1 张)：2x3 六宫格汇总 |
+
+```bash
+# 快速预览 (使用内置样例数据)
+cd visualization
+conda activate comosvc
+python run_and_plot.py --sample
+
+# 运行 Go 测试并生成图表
+python run_and_plot.py
+```
+
+#### 生成的图表清单 (共 20 张)
+
+**竞争场景 (6 张)**
+
+| 图表文件 | 图表内容 |
+|---------|---------|
+| `competition_fairness.png` | 5 个等预算 Agent 公平竞争 — 各 Agent 成功/拒绝调用次数柱状图，右上角标注 Jain 公平性指数 |
+| `competition_unequal_budget.png` | 高预算 vs 低预算 Agent 成功次数对比柱状图，含高/低预算均值水平线 |
+| `competition_escalation.png` | Agent 数量升级 (2→5→10→20) 的拒绝率折线图 + 成功请求数柱状图（双轴） |
+| `competition_multi_tool_isolation.png` | Alpha(快速工具) vs Beta(慢速工具) 成功率对比柱状图，验证跨工具资源隔离 |
+| `competition_strategy_comparison.png` | Fixed/EqualSplit/FrontLoaded/Adaptive 四种策略的成功数 + 效率双轴对比图 |
+| `competition_burst.png` | 10 Agent 突发竞争 — 成功/拒绝饼图 + 关键指标卡片（总请求、吞吐率等） |
+
+**预算管理 (7 张)**
+
+| 图表文件 | 图表内容 |
+|---------|---------|
+| `budget_tiers.png` | 低/中/高三档预算的成功率柱状图 + 调用数 vs 成功数分组对比 |
+| `budget_strategy_benchmark.png` | 4 种策略效率基准 — 左图成功/消耗/效率分组柱状图，右图效率排名水平条形图 |
+| `budget_price_erosion.png` | 5 阶段价格阶梯 (10→30→50→70→100) — 成功/拒绝堆叠柱状图 + 剩余预算折线（双轴） |
+| `budget_adaptive_vs_fixed.png` | 价格波动环境下 Fixed-40 / Fixed-80 / Adaptive 的成功次数 + 令牌消耗对比 |
+| `budget_lifecycle.png` | 10 阶段预算生命周期消耗曲线 — 剩余预算折线 + 每阶段成功数柱状（双轴） |
+| `budget_edge_cases.png` | 零预算 / 最小预算 / 超大预算三种边界条件的调用数 vs 成功数对比 |
+| `budget_conservation.png` | 全局令牌总量守恒验证 — 初始预算 vs (剩余+消耗) 堆叠柱状图 |
+
+**推理链 (6 张)**
+
+| 图表文件 | 图表内容 |
+|---------|---------|
+| `chain_overview.png` | 11 个推理链场景的链完成率水平柱状图（绿≥80% / 橙≥50% / 红<50%） |
+| `chain_retry_effect.png` | 有重试 vs 无重试 — 完成步骤数和总调用数对比，标注链完成/中断状态 |
+| `chain_parallel.png` | 5 Agent 并行推理链 — 各 Agent 完成步骤数柱状图，颜色区分完成/中断 |
+| `chain_strategy_comparison.png` | 推理链模式下 4 策略的步骤完成数 + 效率 (步/千令牌) 对比 |
+| `chain_batch_experiment.png` | N=20 批量实验统计 — 完成率饼图 + 参数指标卡片 + 关键指标达成率进度条 |
+| `chain_competition_impact.png` | 竞争干扰影响 — 无干扰 vs 有干扰 Agent 的链完成率对比，标注下降幅度 |
+
+**综合仪表板 (1 张)**
+
+| 图表文件 | 图表内容 |
+|---------|---------|
+| `dashboard.png` | 2×3 六宫格综合仪表板：竞争公平性 / 竞争升级 / 策略效率排名 / 价格侵蚀 / 推理链完成率 / 关键指标卡片 |
+
+> 详细使用说明请参阅 `visualization/README.md`
+
 #### 多 Agent 竞争资源测试 (`agent_test/competition_test.go`)
 
 | 测试函数 | 说明 |
