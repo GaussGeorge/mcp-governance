@@ -152,58 +152,82 @@ type AblationResult struct {
 	GroupName   string
 	Description string
 	Strategy    StrategyType
+	Pattern     LoadPattern // 负载模式
 	Summary     MetricsSummary
 }
 
 // RunAblationStudy 运行指定策略的消融对照实验
-// 对每个对照组应用不同参数，运行相同的负载测试，收集对比数据
-func (tr *TestRunner) RunAblationStudy(strategy StrategyType, groups []AblationGroup, quick bool) ([]AblationResult, error) {
+// 对每个对照组 × 每种负载模式，运行测试并收集对比数据
+// patterns 为空时默认使用全部三种负载模式 (step/sine/poisson)
+func (tr *TestRunner) RunAblationStudy(strategy StrategyType, groups []AblationGroup, patterns []LoadPattern, quick bool) ([]AblationResult, error) {
 	var results []AblationResult
 
-	// 使用快速测试的阶段配置
-	if quick {
-		tr.cfg.StepPhases = []StepPhase{
-			{Name: "warmup", Duration: 5 * time.Second, Concurrency: 3},
-			{Name: "low", Duration: 10 * time.Second, Concurrency: 10},
-			{Name: "medium", Duration: 10 * time.Second, Concurrency: 30},
-			{Name: "high", Duration: 10 * time.Second, Concurrency: 60},
-			{Name: "overload", Duration: 10 * time.Second, Concurrency: 120},
-			{Name: "recovery", Duration: 10 * time.Second, Concurrency: 5},
-		}
+	if len(patterns) == 0 {
+		patterns = AllLoadPatterns()
 	}
 
+	// 快速测试配置
+	quickStepPhases := []StepPhase{
+		{Name: "warmup", Duration: 5 * time.Second, Concurrency: 3},
+		{Name: "low", Duration: 10 * time.Second, Concurrency: 10},
+		{Name: "medium", Duration: 10 * time.Second, Concurrency: 30},
+		{Name: "high", Duration: 10 * time.Second, Concurrency: 60},
+		{Name: "overload", Duration: 10 * time.Second, Concurrency: 120},
+		{Name: "recovery", Duration: 10 * time.Second, Concurrency: 5},
+	}
+	quickDuration := 1 * time.Minute // sine/poisson 快速模式时长
+
+	totalRuns := len(groups) * len(patterns)
 	fmt.Printf("\n%s\n", strings.Repeat("=", 70))
-	fmt.Printf("  消融对照实验: 策略=%s, 共 %d 组\n", strategy, len(groups))
+	fmt.Printf("  消融对照实验: 策略=%s, %d 组 × %d 负载模式 = %d 次运行\n",
+		strategy, len(groups), len(patterns), totalRuns)
+	fmt.Printf("  负载模式: %v\n", patterns)
 	fmt.Printf("%s\n", strings.Repeat("=", 70))
 
+	runCount := 0
 	for i, group := range groups {
-		fmt.Printf("\n%s\n", strings.Repeat("-", 60))
-		fmt.Printf("  对照组 [%d/%d]: %s\n", i+1, len(groups), group.Name)
-		fmt.Printf("  说明: %s\n", group.Description)
-		fmt.Printf("%s\n", strings.Repeat("-", 60))
+		for _, pattern := range patterns {
+			runCount++
+			fmt.Printf("\n%s\n", strings.Repeat("-", 60))
+			fmt.Printf("  [%d/%d] 对照组: %s | 负载模式: %s\n", runCount, totalRuns, group.Name, pattern)
+			fmt.Printf("  说明: %s\n", group.Description)
+			fmt.Printf("%s\n", strings.Repeat("-", 60))
 
-		// 从默认配置开始，应用对照组参数
-		cfg := *tr.cfg
-		group.ApplyTo(&cfg)
-		cfg.Strategy = strategy
-		cfg.LoadPattern = PatternStep
+			// 从默认配置开始，应用对照组参数
+			cfg := *tr.cfg
+			group.ApplyTo(&cfg)
+			cfg.Strategy = strategy
+			cfg.LoadPattern = pattern
 
-		// 创建临时 runner 用这组配置
-		tempRunner := NewTestRunner(&cfg)
-		summary, err := tempRunner.RunSingleStrategy(strategy, PatternStep, 1)
-		if err != nil {
-			fmt.Printf("[对照组失败] %s: %v\n", group.Name, err)
-			continue
+			// 快速模式：缩短各负载模式的时长
+			if quick {
+				cfg.StepPhases = quickStepPhases
+				cfg.Duration = quickDuration
+			}
+
+			tempRunner := NewTestRunner(&cfg)
+			summary, err := tempRunner.RunSingleStrategy(strategy, pattern, 1)
+			if err != nil {
+				fmt.Printf("[对照组失败] %s / %s: %v\n", group.Name, pattern, err)
+				continue
+			}
+
+			results = append(results, AblationResult{
+				GroupName:   group.Name,
+				Description: group.Description,
+				Strategy:    strategy,
+				Pattern:     pattern,
+				Summary:     *summary,
+			})
+
+			// 运行之间等待，让系统恢复
+			if runCount < totalRuns {
+				fmt.Println("[等待] 2 秒后开始下一次运行...")
+				time.Sleep(2 * time.Second)
+			}
 		}
 
-		results = append(results, AblationResult{
-			GroupName:   group.Name,
-			Description: group.Description,
-			Strategy:    strategy,
-			Summary:     *summary,
-		})
-
-		// 对照组之间等待，让系统恢复
+		// 对照组之间额外等待
 		if i < len(groups)-1 {
 			fmt.Println("[等待] 3 秒后开始下一个对照组...")
 			time.Sleep(3 * time.Second)
@@ -226,23 +250,28 @@ func (tr *TestRunner) RunAblationStudy(strategy StrategyType, groups []AblationG
 	return results, nil
 }
 
-// RunRajomonAblation 运行 Rajomon 参数消融对照实验
+// RunRajomonAblation 运行 Rajomon 参数消融对照实验（全负载模式）
 func (tr *TestRunner) RunRajomonAblation(quick bool) ([]AblationResult, error) {
-	return tr.RunAblationStudy(StrategyRajomon, RajomonAblationGroups(), quick)
+	return tr.RunAblationStudy(StrategyRajomon, RajomonAblationGroups(), AllLoadPatterns(), quick)
 }
 
-// RunStaticRateLimitAblation 运行静态限流参数消融对照实验
+// RunRajomonAblationSinglePattern 运行 Rajomon 参数消融对照实验（指定单一负载模式）
+func (tr *TestRunner) RunRajomonAblationSinglePattern(pattern LoadPattern, quick bool) ([]AblationResult, error) {
+	return tr.RunAblationStudy(StrategyRajomon, RajomonAblationGroups(), []LoadPattern{pattern}, quick)
+}
+
+// RunStaticRateLimitAblation 运行静态限流参数消融对照实验（全负载模式）
 func (tr *TestRunner) RunStaticRateLimitAblation(quick bool) ([]AblationResult, error) {
-	return tr.RunAblationStudy(StrategyStaticRateLimit, StaticRateLimitAblationGroups(), quick)
+	return tr.RunAblationStudy(StrategyStaticRateLimit, StaticRateLimitAblationGroups(), AllLoadPatterns(), quick)
 }
 
-// RunCapacityAblation 运行后端容量消融对照实验（跑全部三种策略）
+// RunCapacityAblation 运行后端容量消融对照实验（全部三种策略 × 全负载模式）
 func (tr *TestRunner) RunCapacityAblation(quick bool) ([]AblationResult, error) {
 	var allResults []AblationResult
 	strategies := []StrategyType{StrategyNoGovernance, StrategyStaticRateLimit, StrategyRajomon}
 
 	for _, strategy := range strategies {
-		results, err := tr.RunAblationStudy(strategy, CapacityAblationGroups(), quick)
+		results, err := tr.RunAblationStudy(strategy, CapacityAblationGroups(), AllLoadPatterns(), quick)
 		if err != nil {
 			fmt.Printf("[容量消融失败] %s: %v\n", strategy, err)
 			continue
@@ -253,21 +282,53 @@ func (tr *TestRunner) RunCapacityAblation(quick bool) ([]AblationResult, error) 
 	return allResults, nil
 }
 
-// RunFullAblation 运行完整的消融实验（Rajomon + 静态限流 + 容量）
+// RunCrossPatternComparison 运行三策略 × 三负载模式全量对比
+func (tr *TestRunner) RunCrossPatternComparison(quick bool) ([]MetricsSummary, error) {
+	var allSummaries []MetricsSummary
+
+	for _, pattern := range AllLoadPatterns() {
+		fmt.Printf("\n%s\n", strings.Repeat("=", 70))
+		fmt.Printf("  负载模式: %s — 对比三种策略\n", pattern)
+		fmt.Printf("%s\n", strings.Repeat("=", 70))
+
+		if quick {
+			tr.cfg.StepPhases = []StepPhase{
+				{Name: "warmup", Duration: 5 * time.Second, Concurrency: 3},
+				{Name: "low", Duration: 10 * time.Second, Concurrency: 10},
+				{Name: "medium", Duration: 10 * time.Second, Concurrency: 30},
+				{Name: "high", Duration: 10 * time.Second, Concurrency: 60},
+				{Name: "overload", Duration: 10 * time.Second, Concurrency: 120},
+				{Name: "recovery", Duration: 10 * time.Second, Concurrency: 5},
+			}
+			tr.cfg.Duration = 1 * time.Minute
+		}
+
+		summaries, err := tr.RunAllStrategies(pattern, 1)
+		if err != nil {
+			fmt.Printf("[负载模式 %s 失败] %v\n", pattern, err)
+			continue
+		}
+		allSummaries = append(allSummaries, summaries...)
+	}
+
+	return allSummaries, nil
+}
+
+// RunFullAblation 运行完整的消融实验（Rajomon + 静态限流 + 容量，全负载模式）
 func (tr *TestRunner) RunFullAblation(quick bool) error {
-	fmt.Println("\n========== [Phase 1] Rajomon 参数消融 ==========")
+	fmt.Println("\n========== [Phase 1] Rajomon 参数消融（跨全部负载模式） ==========")
 	_, err := tr.RunRajomonAblation(quick)
 	if err != nil {
 		return fmt.Errorf("Rajomon 消融失败: %w", err)
 	}
 
-	fmt.Println("\n\n========== [Phase 2] 静态限流参数消融 ==========")
+	fmt.Println("\n\n========== [Phase 2] 静态限流参数消融（跨全部负载模式） ==========")
 	_, err = tr.RunStaticRateLimitAblation(quick)
 	if err != nil {
 		return fmt.Errorf("静态限流消融失败: %w", err)
 	}
 
-	fmt.Println("\n\n========== [Phase 3] 后端容量消融 ==========")
+	fmt.Println("\n\n========== [Phase 3] 后端容量消融（跨全部负载模式） ==========")
 	_, err = tr.RunCapacityAblation(quick)
 	if err != nil {
 		return fmt.Errorf("容量消融失败: %w", err)
@@ -278,27 +339,28 @@ func (tr *TestRunner) RunFullAblation(quick bool) error {
 
 // printAblationTable 打印消融对照结果表格
 func printAblationTable(results []AblationResult) {
-	fmt.Printf("\n%s\n", strings.Repeat("=", 100))
+	fmt.Printf("\n%s\n", strings.Repeat("=", 120))
 	fmt.Println("  消融对照结果汇总")
-	fmt.Printf("%s\n", strings.Repeat("=", 100))
+	fmt.Printf("%s\n", strings.Repeat("=", 120))
 
 	// 表头
-	fmt.Printf("  %-25s %8s %8s %10s %10s %10s %10s\n",
-		"对照组", "吞吐量", "拒绝率", "预算10", "预算50", "预算100", "P95(ms)")
-	fmt.Printf("  %s\n", strings.Repeat("-", 93))
+	fmt.Printf("  %-28s %-8s %8s %8s %10s %10s %10s %10s\n",
+		"对照组", "负载模式", "吞吐量", "拒绝率", "预算10", "预算50", "预算100", "P95(ms)")
+	fmt.Printf("  %s\n", strings.Repeat("-", 113))
 
 	for _, r := range results {
 		b10 := r.Summary.BudgetSuccessRate[10]
 		b50 := r.Summary.BudgetSuccessRate[50]
 		b100 := r.Summary.BudgetSuccessRate[100]
 
-		fmt.Printf("  %-25s %8.2f %8.4f %10.4f %10.4f %10.4f %10.2f\n",
+		fmt.Printf("  %-28s %-8s %8.2f %8.4f %10.4f %10.4f %10.4f %10.2f\n",
 			r.GroupName,
+			string(r.Pattern),
 			r.Summary.ThroughputRPS,
 			r.Summary.RejectionRate,
 			b10, b50, b100,
 			float64(r.Summary.P95LatencyMs))
 	}
 
-	fmt.Printf("%s\n", strings.Repeat("=", 100))
+	fmt.Printf("%s\n", strings.Repeat("=", 120))
 }

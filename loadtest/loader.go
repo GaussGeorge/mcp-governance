@@ -74,15 +74,13 @@ type clientToolCallResult struct {
 
 // LoadGenerator 负载生成器
 type LoadGenerator struct {
-	cfg           *TestConfig
-	serverURL     string
-	httpClient    *http.Client
-	results       []RequestResult
-	resultsMu     sync.Mutex
-	requestIDGen  int64
-	rng           *rand.Rand
-	stopCh        chan struct{}
-	activeWorkers int64 // 当前活跃 worker 数
+	cfg          *TestConfig
+	serverURL    string
+	httpClient   *http.Client
+	results      []RequestResult
+	resultsMu    sync.Mutex
+	requestIDGen int64
+	rng          *rand.Rand
 }
 
 // NewLoadGenerator 创建负载生成器
@@ -100,8 +98,31 @@ func NewLoadGenerator(cfg *TestConfig, serverURL string) *LoadGenerator {
 		},
 		results: make([]RequestResult, 0, 10000),
 		rng:     rand.New(rand.NewSource(cfg.RandomSeed)),
-		stopCh:  make(chan struct{}),
 	}
+}
+
+// pickBudget 按权重随机选择一个预算值
+// 如果 BudgetWeights 为空或长度不匹配，则退化为均匀分布
+func (lg *LoadGenerator) pickBudget() int {
+	budgets := lg.cfg.Budgets
+	weights := lg.cfg.BudgetWeights
+
+	// 无权重或权重长度不匹配 → 均匀随机
+	if len(weights) == 0 || len(weights) != len(budgets) {
+		return budgets[rand.Intn(len(budgets))]
+	}
+
+	// 基于权重的轮盘赌选择
+	r := rand.Float64()
+	cumulative := 0.0
+	for i, w := range weights {
+		cumulative += w
+		if r < cumulative {
+			return budgets[i]
+		}
+	}
+	// 浮点误差兜底
+	return budgets[len(budgets)-1]
 }
 
 // Run 运行负载测试，返回所有请求结果
@@ -167,19 +188,22 @@ func (lg *LoadGenerator) runSinePattern() {
 	ticker := time.NewTicker(adjustInterval)
 	defer ticker.Stop()
 
-	var currentCancel context.CancelFunc
-	var currentWg sync.WaitGroup
+	var (
+		currentCancel   context.CancelFunc
+		currentWg       sync.WaitGroup
+		lastConcurrency int
+	)
 
 	for {
 		select {
 		case <-ticker.C:
 			elapsed := time.Since(startTime)
 			if elapsed >= duration {
-				// 测试结束
+				// 测试结束：取消所有 worker 并等待退出
 				if currentCancel != nil {
 					currentCancel()
-					currentWg.Wait()
 				}
+				currentWg.Wait()
 				return
 			}
 
@@ -191,33 +215,30 @@ func (lg *LoadGenerator) runSinePattern() {
 				concurrency = 1
 			}
 
-			// 获取当前活跃 worker 数
-			currentActive := int(atomic.LoadInt64(&lg.activeWorkers))
-			diff := concurrency - currentActive
-
-			if diff > 0 {
-				// 需要增加 worker
-				ctx, cancel := context.WithCancel(context.Background())
-				_ = cancel // 这些 worker 会在收到外部 stop 时退出
-				if currentCancel != nil {
-					// 保留旧的，追加新的
-					_ = ctx
-				}
-
-				for i := 0; i < diff; i++ {
-					currentWg.Add(1)
-					go func() {
-						defer currentWg.Done()
-						atomic.AddInt64(&lg.activeWorkers, 1)
-						defer atomic.AddInt64(&lg.activeWorkers, -1)
-
-						phaseName := fmt.Sprintf("sine_c%d", concurrency)
-						lg.workerUntilStop(phaseName)
-					}()
-				}
-				currentCancel = cancel
+			// 并发数未变化，跳过调整
+			if concurrency == lastConcurrency {
+				continue
 			}
-			// 注意：减少 worker 由 stop 信号控制，这里简化处理
+			lastConcurrency = concurrency
+
+			// 取消所有旧 worker 并等待它们退出
+			if currentCancel != nil {
+				currentCancel()
+			}
+			currentWg.Wait()
+
+			// 启动新一批 worker，使用 context 控制生命周期
+			ctx, cancel := context.WithCancel(context.Background())
+			currentCancel = cancel
+
+			phaseName := fmt.Sprintf("sine_c%d", concurrency)
+			for i := 0; i < concurrency; i++ {
+				currentWg.Add(1)
+				go func() {
+					defer currentWg.Done()
+					lg.worker(ctx, phaseName)
+				}()
+			}
 		}
 	}
 }
@@ -279,31 +300,14 @@ func (lg *LoadGenerator) worker(ctx context.Context, phase string) {
 	}
 }
 
-// workerUntilStop 持续发送请求直到收到停止信号
-func (lg *LoadGenerator) workerUntilStop(phase string) {
-	for {
-		select {
-		case <-lg.stopCh:
-			return
-		default:
-			rejected := lg.sendOneRequest(phase)
-			if rejected && lg.cfg.RejectionBackoff > 0 {
-				time.Sleep(lg.cfg.RejectionBackoff)
-			} else {
-				time.Sleep(lg.cfg.RequestInterval)
-			}
-		}
-	}
-}
-
 // sendOneRequest 发送一个 MCP tools/call 请求并记录结果
 // 返回 true 表示请求被拒绝（过载/限流/错误）
 func (lg *LoadGenerator) sendOneRequest(phase string) bool {
 	// 生成请求 ID
 	reqID := atomic.AddInt64(&lg.requestIDGen, 1)
 
-	// 随机选择预算
-	budget := lg.cfg.Budgets[rand.Intn(len(lg.cfg.Budgets))]
+	// 按权重随机选择预算
+	budget := lg.pickBudget()
 
 	// 构造 JSON-RPC 请求
 	params := clientToolCallParams{

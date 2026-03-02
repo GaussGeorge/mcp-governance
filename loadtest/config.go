@@ -53,8 +53,9 @@ type TestConfig struct {
 	OverloadLatencyScale float64       // 过载时延迟放大倍数（超过70%容量时生效）
 
 	// 负载配置
-	Budgets  []int  // 客户端预算列表（Token 值）
-	ToolName string // 测试用工具名称
+	Budgets       []int     // 客户端预算列表（Token 值）
+	BudgetWeights []float64 // 各预算的选择权重（与 Budgets 一一对应，为空则均匀分布）
+	ToolName      string    // 测试用工具名称
 
 	// 阶梯式负载配置
 	StepPhases []StepPhase // 阶梯式负载的各阶段
@@ -198,6 +199,18 @@ type AblationGroup struct {
 	PriceUpdateRate *time.Duration
 	// PriceStrategy: 价格策略 "step"(简单步进) 或 "expdecay"(指数衰减)
 	PriceStrategy *string
+	// PriceAggregation: 价格聚合策略 "maximal"(短板效应) / "additive"(累加) / "mean"(平均)
+	//   - maximal: 取自身与下游价格的最大值（适用于并行调用，瓶颈决定成本）
+	//   - additive: 自身 + 下游价格累加（适用于串行调用链）
+	//   - mean: 取平均值（平滑波动）
+	PriceAggregation *string
+
+	// === 预算分布参数（用于极端压力测试） ===
+	// Budgets: 自定义预算列表（覆盖默认值）
+	Budgets []int
+	// BudgetWeights: 各预算的选择权重（与 Budgets 一一对应）
+	//   - 例如 [0.9, 0.1] 表示 90% 低预算、10% 高预算
+	BudgetWeights []float64
 
 	// === 静态限流参数 ===
 	// StaticRateLimitQPS: 固定限流的 QPS 上限
@@ -228,11 +241,20 @@ func (ag *AblationGroup) ApplyTo(cfg *TestConfig) {
 	if ag.PriceStrategy != nil {
 		cfg.RajomonPriceStrategy = *ag.PriceStrategy
 	}
+	if ag.PriceAggregation != nil {
+		cfg.RajomonPriceAggregation = *ag.PriceAggregation
+	}
 	if ag.StaticRateLimitQPS != nil {
 		cfg.StaticRateLimitQPS = *ag.StaticRateLimitQPS
 	}
 	if ag.StaticBurstSize != nil {
 		cfg.StaticBurstSize = *ag.StaticBurstSize
+	}
+	if ag.Budgets != nil {
+		cfg.Budgets = ag.Budgets
+	}
+	if ag.BudgetWeights != nil {
+		cfg.BudgetWeights = ag.BudgetWeights
 	}
 }
 
@@ -243,112 +265,4 @@ func float64Ptr(v float64) *float64              { return &v }
 func durationPtr(v time.Duration) *time.Duration { return &v }
 func stringPtr(v string) *string                 { return &v }
 
-// ==================== 预定义对照组 ====================
-
-// RajomonAblationGroups 返回 Rajomon 动态定价的参数对照组
-// 用于探索 priceStep 和 latencyThreshold 的组合对吞吐量、公平性的影响
-func RajomonAblationGroups() []AblationGroup {
-	return []AblationGroup{
-		{
-			// 对照组 A：保守配置（当前默认）
-			// 严格的延迟阈值 + 较小步长 → 快速涨价但幅度不大
-			// 预期：低吞吐，低延迟，预算区分度一般
-			Name:             "rajomon_conservative",
-			Description:      "保守配置: priceStep=5, threshold=800µs — 严格延迟容忍+小步长",
-			PriceStep:        int64Ptr(5),
-			LatencyThreshold: durationPtr(800 * time.Microsecond),
-		},
-		{
-			// 对照组 B：提升容量上限（放宽延迟阈值）
-			// 更高容忍度 → Rajomon 允许更多流量通过再涨价
-			// 预期：吞吐量提升至 200+，但延迟也会略高
-			Name:             "rajomon_relaxed",
-			Description:      "放宽阈值: priceStep=5, threshold=2000µs — 高容忍度+小步长",
-			PriceStep:        int64Ptr(5),
-			LatencyThreshold: durationPtr(2000 * time.Microsecond),
-		},
-		{
-			// 对照组 C：加大步长（增强预算区分度）
-			// 大步长 → 价格快速飙升 → 低预算客户迅速被挤出
-			// 预期：Budget 100 成功率显著提升(60-80%)，Budget 10 接近 0%
-			Name:             "rajomon_steep",
-			Description:      "大步长: priceStep=20, threshold=800µs — 小阈值+陡峭涨价",
-			PriceStep:        int64Ptr(20),
-			LatencyThreshold: durationPtr(800 * time.Microsecond),
-		},
-		{
-			// 对照组 D：平衡配置（推荐）
-			// 适当放宽阈值 + 中等步长 → 兼顾吞吐量和预算公平性
-			// 预期：吞吐量 ~200 RPS，Budget 100 达 50-70% 成功率
-			Name:             "rajomon_balanced",
-			Description:      "平衡配置: priceStep=12, threshold=1500µs — 中等阈值+中步长",
-			PriceStep:        int64Ptr(12),
-			LatencyThreshold: durationPtr(1500 * time.Microsecond),
-		},
-		{
-			// 对照组 E：激进配置
-			// 高阈值 + 大步长 → 允许大量流量 + 一旦过载就剧烈涨价
-			// 预期：高吞吐，极端的预算区分（高预算几乎独享）
-			Name:             "rajomon_aggressive",
-			Description:      "激进配置: priceStep=25, threshold=3000µs — 高阈值+大步长",
-			PriceStep:        int64Ptr(25),
-			LatencyThreshold: durationPtr(3000 * time.Microsecond),
-		},
-	}
-}
-
-// StaticRateLimitAblationGroups 返回静态限流的参数对照组
-// 用于对比不同 QPS 阈值下的限流效果
-func StaticRateLimitAblationGroups() []AblationGroup {
-	return []AblationGroup{
-		{
-			Name:               "static_strict",
-			Description:        "严格限流: QPS=20, Burst=20 — 低通量高保护",
-			StaticRateLimitQPS: float64Ptr(20.0),
-			StaticBurstSize:    intPtr(20),
-		},
-		{
-			Name:               "static_default",
-			Description:        "默认限流: QPS=30, Burst=30 — 标准配置",
-			StaticRateLimitQPS: float64Ptr(30.0),
-			StaticBurstSize:    intPtr(30),
-		},
-		{
-			Name:               "static_moderate",
-			Description:        "适中限流: QPS=60, Burst=60 — 提升通量",
-			StaticRateLimitQPS: float64Ptr(60.0),
-			StaticBurstSize:    intPtr(60),
-		},
-		{
-			Name:               "static_relaxed",
-			Description:        "宽松限流: QPS=100, Burst=100 — 高通量，接近无限流",
-			StaticRateLimitQPS: float64Ptr(100.0),
-			StaticBurstSize:    intPtr(100),
-		},
-	}
-}
-
-// CapacityAblationGroups 返回后端容量的参数对照组
-// 用于对比不同后端容量下三种策略的表现差异
-func CapacityAblationGroups() []AblationGroup {
-	return []AblationGroup{
-		{
-			Name:                 "capacity_small",
-			Description:          "小容量后端: maxConcurrency=30 — 资源紧张",
-			MaxServerConcurrency: intPtr(30),
-			OverloadLatencyScale: float64Ptr(10.0),
-		},
-		{
-			Name:                 "capacity_default",
-			Description:          "默认容量后端: maxConcurrency=50 — 标准配置",
-			MaxServerConcurrency: intPtr(50),
-			OverloadLatencyScale: float64Ptr(8.0),
-		},
-		{
-			Name:                 "capacity_large",
-			Description:          "大容量后端: maxConcurrency=100 — 资源充裕",
-			MaxServerConcurrency: intPtr(100),
-			OverloadLatencyScale: float64Ptr(5.0),
-		},
-	}
-}
+// 注: 消融对照组的定义已移至 ablation_config.go

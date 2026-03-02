@@ -200,32 +200,49 @@ func TestMCPServer_ToolCallGovernance(t *testing.T) {
 
 // TestMCPServer_HighConcurrency 测试高并发下的价格自适应机制
 // 验证在大量并发工具调用下，治理引擎能否检测过载并提高价格
+
+// 原来工具处理函数用 time.Sleep(1s) 模拟延迟，但 sleep 只是让 goroutine 休眠，
+// 不占用 CPU，Go 调度器不会产生排队竞争。
+// 而 pinpointQueuing 检测的是 Go runtime 调度器的排队延迟（/sched/latencies:seconds），
+// 所以 gap latency 始终为 0，价格永远不涨。
 func TestMCPServer_HighConcurrency(t *testing.T) {
 	// 配置：开启排队延迟检测
+	// 使用较低的延迟阈值和较大的价格步长，确保在测试时间内价格能上涨
 	opts := map[string]interface{}{
-		"priceUpdateRate":  5000 * time.Microsecond,
-		"tokenUpdateRate":  100000 * time.Microsecond,
-		"latencyThreshold": 500 * time.Microsecond,
-		"priceStep":        int64(180),
-		"priceStrategy":    "expdecay",
-		"lazyResponse":     false,
-		"rateLimiting":     true,
-		"loadShedding":     true,
-		"pinpointQueuing":  true, // 开启排队延迟检测
+		"priceUpdateRate":  5000 * time.Microsecond,   // 价格更新频率：5ms
+		"tokenUpdateRate":  100000 * time.Microsecond, // 令牌更新频率：100ms
+		"latencyThreshold": 100 * time.Microsecond,    // 延迟阈值：降低到 100µs，使检测更敏感
+		"priceStep":        int64(180),                // 价格调整步长
+		"priceStrategy":    "expdecay",                // 指数衰减策略
+		"lazyResponse":     false,                     // 关闭懒响应
+		"rateLimiting":     true,                      // 开启限流
+		"loadShedding":     true,                      // 开启负载削减
+		"pinpointQueuing":  true,                      // 开启排队延迟检测
 	}
 
 	callMap := map[string][]string{"heavy_tool": {}}
 	gov := NewMCPGovernor("node-1", callMap, opts)
 	server := NewMCPServer("heavy-service", gov)
 
-	// 注册一个"重"工具（模拟耗时操作）
+	// 注册一个"重"工具
+	// 关键：使用 CPU 密集型操作而非 time.Sleep，才能真正触发 Go 调度器排队延迟
+	// time.Sleep 只是让 goroutine 休眠，不会造成调度器竞争，排队延迟始终为 0
 	server.RegisterTool(MCPTool{
 		Name:        "heavy_tool",
-		Description: "模拟耗时工具调用",
+		Description: "模拟耗时工具调用（CPU 密集型）",
 		InputSchema: map[string]interface{}{"type": "object"},
 	}, func(ctx context.Context, params MCPToolCallParams) (*MCPToolCallResult, error) {
-		// 模拟 1 秒的处理延迟
-		time.Sleep(1 * time.Second)
+		// 混合模拟：30% CPU 密集 + 70% 休眠
+		// CPU 密集部分会产生调度器排队延迟，触发 queuingCheck 涨价
+		cpuDeadline := time.Now().Add(30 * time.Millisecond)
+		x := 1.0
+		for time.Now().Before(cpuDeadline) {
+			for i := 0; i < 100; i++ {
+				x = x*1.0000001 + 0.0000001
+			}
+		}
+		_ = x
+		time.Sleep(70 * time.Millisecond)
 		return &MCPToolCallResult{
 			Content: []ContentBlock{TextContent("处理完成")},
 		}, nil
@@ -260,7 +277,7 @@ func TestMCPServer_HighConcurrency(t *testing.T) {
 		}()
 	}
 
-	// 让负载持续一段时间
+	// 让负载持续一段时间，等待价格检测生效
 	time.Sleep(testDuration / 2)
 
 	// 检查价格是否上涨
@@ -270,7 +287,7 @@ func TestMCPServer_HighConcurrency(t *testing.T) {
 	}
 
 	if priceStr == "0" {
-		t.Logf("⚠️ 价格暂未上涨 (可能需要更高并发或更长时间): price=%s", priceStr)
+		t.Errorf("❌ 价格未上涨: price=%s (200 并发 CPU 密集负载下应触发涨价)", priceStr)
 	} else {
 		t.Logf("✅ 高并发下价格已上涨: price=%s", priceStr)
 	}

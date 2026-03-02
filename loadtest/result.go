@@ -177,7 +177,7 @@ func WriteAblationToCSV(results []AblationResult, outputDir string) (string, err
 	defer w.Flush()
 
 	header := []string{
-		"group_name", "description", "strategy",
+		"group_name", "description", "strategy", "pattern",
 		"total_requests", "success_count", "rejected_count",
 		"throughput_rps", "error_rate", "rejection_rate",
 		"avg_latency_ms", "p50_latency_ms", "p95_latency_ms", "p99_latency_ms",
@@ -196,7 +196,7 @@ func WriteAblationToCSV(results []AblationResult, outputDir string) (string, err
 		b100 := fmt.Sprintf("%.4f", s.BudgetSuccessRate[100])
 
 		row := []string{
-			r.GroupName, r.Description, string(r.Strategy),
+			r.GroupName, r.Description, string(r.Strategy), string(r.Pattern),
 			strconv.FormatInt(s.TotalRequests, 10),
 			strconv.FormatInt(s.SuccessCount, 10),
 			strconv.FormatInt(s.RejectedCount, 10),

@@ -17,7 +17,12 @@ import (
 
 // TestQuickComparison 快速对比三种策略
 // 使用较短的阶段时长，快速验证三种策略的行为差异
+// 运行耗时约 3 分钟（3 策略 × ~55s），使用 -short 跳过
 func TestQuickComparison(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过快速对比测试（使用 -short 标志），请单独运行: go test -v -run TestQuickComparison -timeout 10m")
+	}
+
 	cfg := DefaultTestConfig()
 	cfg.OutputDir = "output/test_quick"
 	cfg.Verbose = false
@@ -45,6 +50,10 @@ func TestQuickComparison(t *testing.T) {
 
 // TestSingleStrategy 逐个测试每种策略
 func TestSingleStrategy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过单策略测试（-short 模式）")
+	}
+
 	strategies := []struct {
 		name     string
 		strategy StrategyType
@@ -59,10 +68,12 @@ func TestSingleStrategy(t *testing.T) {
 			cfg := DefaultTestConfig()
 			cfg.OutputDir = "output/test_single"
 			cfg.StepPhases = []StepPhase{
-				{Name: "warmup", Duration: 3 * time.Second, Concurrency: 3},
-				{Name: "low", Duration: 5 * time.Second, Concurrency: 10},
-				{Name: "high", Duration: 5 * time.Second, Concurrency: 50},
-				{Name: "recovery", Duration: 5 * time.Second, Concurrency: 5},
+				{Name: "warmup", Duration: 5 * time.Second, Concurrency: 3},
+				{Name: "low", Duration: 10 * time.Second, Concurrency: 10},
+				{Name: "medium", Duration: 10 * time.Second, Concurrency: 30},
+				{Name: "high", Duration: 10 * time.Second, Concurrency: 60},
+				{Name: "overload", Duration: 10 * time.Second, Concurrency: 120},
+				{Name: "recovery", Duration: 10 * time.Second, Concurrency: 5},
 			}
 
 			runner := NewTestRunner(cfg)
@@ -134,6 +145,10 @@ func TestStepLoadAllStrategies(t *testing.T) {
 // TestRajomonPriceDynamics 验证 Rajomon 动态定价机制
 // 确认价格随负载变化（核心功能验证）
 func TestRajomonPriceDynamics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过 Rajomon 动态定价测试（-short 模式）")
+	}
+
 	cfg := DefaultTestConfig()
 	cfg.Strategy = StrategyRajomon
 	cfg.OutputDir = "output/test_price_dynamics"
