@@ -1,6 +1,17 @@
 // metrics.go
-// 指标计算与统计分析
-// 从请求结果中计算性能指标、治理效果指标和公平性指标
+// 指标计算与统计分析模块
+//
+// 本文件负责将 loader.go 产出的原始 RequestResult 切片转换为可用于对比和导出的统计指标。
+// 计算分为三个层次：
+//  1. 基础性能指标：吞吐量(RPS)、延迟百分位(P50/P95/P99)、错误率、拒绝率
+//  2. 公平性指标：按预算分组的成功率（Rajomon 特有的评估维度）
+//  3. 阶段指标：仅在 step 负载模式下，分阶段统计上述指标
+//
+// 数据流向：
+//
+//	[]RequestResult → CalculateMetrics() → MetricsSummary
+//	MetricsSummary   → PrintSummary()         → 终端报告
+//	[]MetricsSummary → PrintComparisonTable() → 多策略对比表
 package main
 
 import (
@@ -10,53 +21,69 @@ import (
 	"strings"
 )
 
-// MetricsSummary 一次测试运行的汇总指标
+// MetricsSummary 一次测试运行的汇总指标（核心数据结构）
+// 用于：
+//   - 终端报告打印（PrintSummary / PrintComparisonTable）
+//   - CSV 导出（WriteSummaryToCSV / WriteAblationToCSV）
+//   - 作为 runner.go 中 RunSingleStrategy 的返回值
 type MetricsSummary struct {
-	Strategy StrategyType // 测试策略
-	Pattern  LoadPattern  // 负载模式
-	RunIndex int          // 运行序号
+	Strategy StrategyType // 测试策略（no_governance / static_rate_limit / rajomon）
+	Pattern  LoadPattern  // 负载模式（step / sine / poisson）
+	RunIndex int          // 运行序号（同策略多次运行时区分）
 
-	// 基础统计
-	TotalRequests   int64   // 总请求数
-	SuccessCount    int64   // 成功请求数
-	ErrorCount      int64   // 错误请求数
-	RejectedCount   int64   // 被拒绝的请求数（过载/限流）
-	DurationSeconds float64 // 测试持续时间（秒）
+	// 基础计数统计
+	TotalRequests   int64   // 总请求数 = 成功 + 拒绝 + 错误
+	SuccessCount    int64   // 成功请求数（HTTP 200 且无错误）
+	ErrorCount      int64   // 错误请求数（网络错误、服务器内部错误等）
+	RejectedCount   int64   // 被拒绝的请求数（过载/限流/价格超预算）
+	DurationSeconds float64 // 测试实际持续时间（秒，由首尾请求时间戳计算）
 
 	// 性能指标
-	ThroughputRPS   float64 // 吞吐量（每秒成功请求数）
-	ErrorRate       float64 // 错误率
-	RejectionRate   float64 // 拒绝率
+	ThroughputRPS   float64 // 吞吐量：每秒成功请求数 = SuccessCount / DurationSeconds
+	ErrorRate       float64 // 错误率 = ErrorCount / TotalRequests（0.0~1.0）
+	RejectionRate   float64 // 拒绝率 = RejectedCount / TotalRequests（0.0~1.0）
 	AvgLatencyMs    float64 // 平均延迟（毫秒）
-	P50LatencyMs    float64 // P50 延迟
-	P95LatencyMs    float64 // P95 延迟
-	P99LatencyMs    float64 // P99 延迟
+	P50LatencyMs    float64 // P50 延迟（中位数）
+	P95LatencyMs    float64 // P95 延迟（尾部延迟的主要指标）
+	P99LatencyMs    float64 // P99 延迟（极端情况）
 	MaxLatencyMs    float64 // 最大延迟
 	MinLatencyMs    float64 // 最小延迟
-	LatencyStddevMs float64 // 延迟标准差
+	LatencyStddevMs float64 // 延迟标准差（衡量延迟稳定性）
 
-	// 公平性指标：各预算组的成功率
+	// 公平性指标：按 Token 预算分组的成功率
+	// key = 客户端预算值（如 10/50/100），value = 该预算组的成功率
+	// Rajomon 策略的核心评估维度：预算高的客户应该有更高成功率
 	BudgetSuccessRate map[int]float64 // budget → success_rate
 
-	// 阶段指标（仅阶梯模式）
+	// 阶段指标（仅 step 负载模式有效）
+	// key = 阶段名称（warmup/low/medium/high/overload/recovery）
 	PhaseMetrics map[string]*PhaseMetricsSummary
 }
 
-// PhaseMetricsSummary 单阶段的汇总指标
+// PhaseMetricsSummary 单阶段的汇总指标（仅用于 step 负载模式）
+// 在 step 负载模式下，每个阶段（warmup/low/medium/high/overload/recovery）
+// 的并发度不同，分阶段统计可以观察服务器在不同压力下的行为变化
 type PhaseMetricsSummary struct {
-	PhaseName     string
-	TotalRequests int64
-	SuccessCount  int64
-	RejectedCount int64
-	AvgLatencyMs  float64
-	P95LatencyMs  float64
-	P99LatencyMs  float64
-	ThroughputRPS float64
-	ErrorRate     float64
-	RejectionRate float64
+	PhaseName     string  // 阶段名称（warmup/low/medium/high/overload/recovery）
+	TotalRequests int64   // 本阶段总请求数
+	SuccessCount  int64   // 本阶段成功数
+	RejectedCount int64   // 本阶段被拒绝数
+	AvgLatencyMs  float64 // 本阶段平均延迟 (ms)
+	P95LatencyMs  float64 // 本阶段 P95 延迟
+	P99LatencyMs  float64 // 本阶段 P99 延迟
+	ThroughputRPS float64 // 本阶段吞吐量
+	ErrorRate     float64 // 本阶段错误率
+	RejectionRate float64 // 本阶段拒绝率
 }
 
-// CalculateMetrics 从请求结果计算汇总指标
+// CalculateMetrics 从原始请求结果计算汇总指标（核心计算函数）
+// 计算流程：
+//  1. 遍历所有 results，统计成功/拒绝/错误计数，收集延迟数据
+//  2. 按预算分组统计成功率（公平性分析）
+//  3. 按阶段分组统计（step 模式专属）
+//  4. 计算百分位数、标准差等派生指标
+//
+// 【参数】results 为 LoadGenerator.Run() 的输出，其余参数用于标记当前运行的上下文
 func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern LoadPattern, runIndex int) MetricsSummary {
 	summary := MetricsSummary{
 		Strategy:          strategy,
@@ -73,11 +100,11 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 	summary.TotalRequests = int64(len(results))
 
 	// 收集延迟数据和各类计数
-	var latencies []float64
+	var latencies []float64              // 所有有效请求的延迟值（排除网络错误）
 	budgetTotal := make(map[int]int64)   // 各预算组总请求数
 	budgetSuccess := make(map[int]int64) // 各预算组成功请求数
 
-	// 按阶段分组的数据
+	// 按阶段分组的数据（step 负载模式专属，其他模式下 Phase 为空）
 	phaseResults := make(map[string][]RequestResult)
 
 	var minTS, maxTS int64
@@ -100,7 +127,7 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 			summary.ErrorCount++
 		}
 
-		// 延迟数据（仅统计非网络错误的请求）
+		// 延迟数据（仅统计非网络错误的请求，StatusCode==-1 表示连接失败）
 		if r.StatusCode != -1 {
 			latencies = append(latencies, float64(r.LatencyMs))
 		}
@@ -117,7 +144,7 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 		}
 	}
 
-	// 计算持续时间
+	// 计算测试实际持续时间（从第一个请求到最后一个请求的时间差）
 	summary.DurationSeconds = float64(maxTS-minTS) / 1000.0
 	if summary.DurationSeconds <= 0 {
 		summary.DurationSeconds = 1
@@ -132,7 +159,7 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 		summary.RejectionRate = float64(summary.RejectedCount) / float64(summary.TotalRequests)
 	}
 
-	// 计算延迟统计
+	// 计算延迟统计（需先排序以便计算百分位数）
 	if len(latencies) > 0 {
 		sort.Float64s(latencies)
 		summary.MinLatencyMs = latencies[0]
@@ -144,7 +171,8 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 		summary.LatencyStddevMs = stddev(latencies)
 	}
 
-	// 计算各预算组成功率
+	// 计算各预算组成功率（公平性核心指标）
+	// Rajomon 的设计目标：预算高的客户端应获得更高成功率
 	for budget, total := range budgetTotal {
 		if total > 0 {
 			summary.BudgetSuccessRate[budget] = float64(budgetSuccess[budget]) / float64(total)
@@ -159,7 +187,9 @@ func CalculateMetrics(results []RequestResult, strategy StrategyType, pattern Lo
 	return summary
 }
 
-// calculatePhaseMetrics 计算单阶段指标
+// calculatePhaseMetrics 计算单阶段指标（step 模式专属）
+// 计算逻辑与 CalculateMetrics 类似，但范围缩小到单个阶段的 results
+// 用于观察服务器在不同并发度下的行为变化（如 overload 阶段的拒绝率飙升）
 func calculatePhaseMetrics(phase string, results []RequestResult) *PhaseMetricsSummary {
 	pm := &PhaseMetricsSummary{
 		PhaseName:     phase,
@@ -215,7 +245,9 @@ func calculatePhaseMetrics(phase string, results []RequestResult) *PhaseMetricsS
 }
 
 // ==================== 统计辅助函数 ====================
+// 提供基础的描述性统计计算，输入均为已排序或未排序的 float64 切片
 
+// mean 计算算术平均值
 func mean(data []float64) float64 {
 	if len(data) == 0 {
 		return 0
@@ -227,6 +259,8 @@ func mean(data []float64) float64 {
 	return sum / float64(len(data))
 }
 
+// stddev 计算样本标准差（无偏估计，分母为 n-1）
+// 用于衡量延迟的稳定性，标准差越小说明响应时间越稳定
 func stddev(data []float64) float64 {
 	if len(data) <= 1 {
 		return 0
@@ -240,6 +274,10 @@ func stddev(data []float64) float64 {
 	return math.Sqrt(sumSq / float64(len(data)-1))
 }
 
+// percentile 计算百分位数（线性插值法）
+// 【前置条件】sortedData 必须已按升序排列
+// 【参数】p 为百分位数值（0~100），如 p=95 表示 P95
+// 【算法】当计算位置落在两个数据点之间时，按比例做线性插值
 func percentile(sortedData []float64, p float64) float64 {
 	if len(sortedData) == 0 {
 		return 0
@@ -263,8 +301,10 @@ func percentile(sortedData []float64, p float64) float64 {
 }
 
 // ==================== 报告输出 ====================
+// 将统计结果格式化打印到终端，方便实时观察测试进展
 
-// PrintSummary 打印汇总报告到控制台
+// PrintSummary 打印单次运行的详细汇总报告
+// 包含：基础计数 → 性能指标 → 延迟分布 → 公平性（按预算分组） → 分阶段指标
 func PrintSummary(summary MetricsSummary) {
 	sep := strings.Repeat("=", 60)
 	fmt.Println(sep)
@@ -326,7 +366,9 @@ func PrintSummary(summary MetricsSummary) {
 	fmt.Println(sep)
 }
 
-// PrintComparisonTable 打印多策略对比表
+// PrintComparisonTable 打印多策略对比表（横向对比）
+// 上半部分：性能指标对比（吞吐量、延迟、错误率、拒绝率）
+// 下半部分：公平性对比（预算10/50/100 三个典型组的成功率）
 func PrintComparisonTable(summaries []MetricsSummary) {
 	fmt.Println()
 	fmt.Println(strings.Repeat("=", 100))

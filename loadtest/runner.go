@@ -1,6 +1,24 @@
 // runner.go
-// 测试运行器
-// 编排服务器启动、负载生成、指标收集、结果导出的完整流程
+// ==================== 测试运行器（测试编排核心） ====================
+//
+// 【文件在整体测试流程中的位置】
+//
+//	main.go 创建 TestRunner 后，调用其各种 Run 方法来执行测试。
+//	TestRunner 是整个 loadtest 的"指挥官"，编排以下完整流水线：
+//	  ① 启动 HTTP 服务器（调用 server.go 的 StartXxxServer）
+//	  ② 创建负载生成器并运行（调用 loader.go 的 LoadGenerator.Run）
+//	  ③ 收集请求结果（loader 返回 []RequestResult）
+//	  ④ 计算统计指标（调用 metrics.go 的 CalculateMetrics）
+//	  ⑤ 导出 CSV 文件（调用 result.go 的 WriteResultsToCSV/WriteSummaryToCSV）
+//	  ⑥ 优雅关闭服务器（defer ServerInstance.Stop()）
+//
+// 【支持的运行模式】
+//   - RunSingleStrategy    : 单策略运行（最底层方法，其他方法最终都调用它）
+//   - RunAllStrategies     : 三种策略对比运行（循环调用 RunSingleStrategy）
+//   - RunQuickTest         : 快速验证（缩短阶段时长后调用 RunAllStrategies）
+//   - RunAblationStudy     : 消融实验（遍历对照组 × 负载模式，逐一运行）
+//   - RunCrossPatternComparison : 三策略 × 三负载模式全量对比
+//   - RunFullAblation      : 完整消融（Rajomon + 静态限流 + 容量）
 package main
 
 import (
@@ -10,17 +28,26 @@ import (
 )
 
 // TestRunner 测试运行器
+// 持有全局配置 cfg，所有测试方法都基于此配置运行。
+// 消融实验时会临时复制配置并用 AblationGroup.ApplyTo() 覆盖部分参数。
 type TestRunner struct {
-	cfg *TestConfig
+	cfg *TestConfig // 全局测试配置（来自 main.go 解析的命令行参数 + 默认值）
 }
 
-// NewTestRunner 创建测试运行器
+// NewTestRunner 创建测试运行器实例
 func NewTestRunner(cfg *TestConfig) *TestRunner {
 	return &TestRunner{cfg: cfg}
 }
 
-// RunSingleStrategy 运行单策略测试
-// 启动对应策略的服务器 → 生成负载 → 收集指标 → 导出结果
+// RunSingleStrategy 运行单策略测试（最底层的执行方法）
+// 完整流水线：启动服务器 → 生成负载 → 收集指标 → 导出 CSV → 关闭服务器
+// 【参数说明】
+//
+//	strategy : 要测试的治理策略
+//	pattern  : 负载模式（step/sine/poisson）
+//	runIndex : 当前是第几次运行（用于 CSV 文件名和日志区分）
+//
+// 【返回值】MetricsSummary 包含本次运行的全部统计指标
 func (tr *TestRunner) RunSingleStrategy(strategy StrategyType, pattern LoadPattern, runIndex int) (*MetricsSummary, error) {
 	cfg := *tr.cfg
 	cfg.Strategy = strategy
@@ -81,7 +108,15 @@ func (tr *TestRunner) RunSingleStrategy(strategy StrategyType, pattern LoadPatte
 }
 
 // RunAllStrategies 运行所有策略的对比测试
-// 对每种策略运行指定次数，取平均结果
+// 遍历三种策略（no_governance / static_rate_limit / rajomon），每种运行 runs 次
+// 运行结束后：
+//  1. 从每种策略取最后一次运行结果，打印对比表格
+//  2. 将全部运行汇总导出为 CSV（summary_xxx.csv）
+//
+// 【参数说明】
+//
+//	pattern : 使用的负载模式（step/sine/poisson）
+//	runs    : 每种策略重复运行次数（用于平均化结果）
 func (tr *TestRunner) RunAllStrategies(pattern LoadPattern, runs int) ([]MetricsSummary, error) {
 	strategies := []StrategyType{StrategyNoGovernance, StrategyStaticRateLimit, StrategyRajomon}
 	var allSummaries []MetricsSummary
@@ -129,7 +164,9 @@ func (tr *TestRunner) RunAllStrategies(pattern LoadPattern, runs int) ([]Metrics
 	return allSummaries, nil
 }
 
-// RunQuickTest 快速测试：缩短阶段时长，用于验证正确性
+// RunQuickTest 快速测试（CI 或本地验证用）
+// 使用缩短的阶段时长（每阶段 5~10 秒，总计约 1 分钟），仅运行 step 模式各策略各 1 次
+// 适用于快速检查代码改动后各策略的基本行为是否正常，不做统计显著性分析
 func (tr *TestRunner) RunQuickTest() ([]MetricsSummary, error) {
 	// 使用较短的阶段时长
 	tr.cfg.StepPhases = []StepPhase{
@@ -146,19 +183,31 @@ func (tr *TestRunner) RunQuickTest() ([]MetricsSummary, error) {
 }
 
 // ==================== 消融对照组测试 (Ablation Study) ====================
+// 消融实验核心思想：每次只改变一个参数（或一组参数），对比观察对性能指标的影响
+// 支持 Rajomon 参数消融、静态限流参数消融、后端容量消融三类
 
 // AblationResult 单个对照组的测试结果
+// 一个 AblationResult = 一个参数组合 + 一种负载模式下的完整指标快照
 type AblationResult struct {
-	GroupName   string
-	Description string
-	Strategy    StrategyType
-	Pattern     LoadPattern // 负载模式
-	Summary     MetricsSummary
+	GroupName   string         // 对照组名称，如 "A1-高灵敏度" "B2-长窗口"
+	Description string         // 对照组描述，说明参数变更内容
+	Strategy    StrategyType   // 所属策略（rajomon / static_rate_limit 等）
+	Pattern     LoadPattern    // 使用的负载模式（step / sine / poisson）
+	Summary     MetricsSummary // 本次运行的全部统计指标
 }
 
-// RunAblationStudy 运行指定策略的消融对照实验
-// 对每个对照组 × 每种负载模式，运行测试并收集对比数据
-// patterns 为空时默认使用全部三种负载模式 (step/sine/poisson)
+// RunAblationStudy 运行指定策略的消融对照实验（消融实验的核心调度方法）
+// 执行流程：
+//  1. 遍历 groups × patterns 的全排列（如 20 组 × 3 模式 = 60 次运行）
+//  2. 对每个组合：从默认配置出发 → ApplyTo 覆盖参数 → 创建临时 Runner → RunSingleStrategy
+//  3. 收集所有 AblationResult → 打印对照表格 → 导出 ablation_xxx.csv
+//
+// 【参数说明】
+//
+//	strategy : 要测试的策略
+//	groups   : 消融对照组列表（来自 ablation_config.go）
+//	patterns : 使用的负载模式列表，为空时默认使用全部三种
+//	quick    : 是否使用缩短的阶段时长（加速测试）
 func (tr *TestRunner) RunAblationStudy(strategy StrategyType, groups []AblationGroup, patterns []LoadPattern, quick bool) ([]AblationResult, error) {
 	var results []AblationResult
 
@@ -251,21 +300,28 @@ func (tr *TestRunner) RunAblationStudy(strategy StrategyType, groups []AblationG
 }
 
 // RunRajomonAblation 运行 Rajomon 参数消融对照实验（全负载模式）
+// 便捷方法：使用 RajomonAblationGroups() 的 20+ 组参数 × 3 种负载模式
+// 测试 Rajomon 的灵敏度、窗口大小、价格范围、Token 预算分布、延迟阈值等参数的影响
 func (tr *TestRunner) RunRajomonAblation(quick bool) ([]AblationResult, error) {
 	return tr.RunAblationStudy(StrategyRajomon, RajomonAblationGroups(), AllLoadPatterns(), quick)
 }
 
 // RunRajomonAblationSinglePattern 运行 Rajomon 参数消融对照实验（指定单一负载模式）
+// 当只需对某一种负载模式做消融分析时使用，减少运行总次数
 func (tr *TestRunner) RunRajomonAblationSinglePattern(pattern LoadPattern, quick bool) ([]AblationResult, error) {
 	return tr.RunAblationStudy(StrategyRajomon, RajomonAblationGroups(), []LoadPattern{pattern}, quick)
 }
 
 // RunStaticRateLimitAblation 运行静态限流参数消融对照实验（全负载模式）
+// 便捷方法：使用 StaticRateLimitAblationGroups() 定义的参数组
+// 测试不同令牌桶速率和突发量对限流效果的影响
 func (tr *TestRunner) RunStaticRateLimitAblation(quick bool) ([]AblationResult, error) {
 	return tr.RunAblationStudy(StrategyStaticRateLimit, StaticRateLimitAblationGroups(), AllLoadPatterns(), quick)
 }
 
 // RunCapacityAblation 运行后端容量消融对照实验（全部三种策略 × 全负载模式）
+// 与其他消融不同：本方法同时对三种策略做容量消融，以便横向对比
+// 不同处理容量对各策略在相同负载模式下的表现差异
 func (tr *TestRunner) RunCapacityAblation(quick bool) ([]AblationResult, error) {
 	var allResults []AblationResult
 	strategies := []StrategyType{StrategyNoGovernance, StrategyStaticRateLimit, StrategyRajomon}
@@ -283,6 +339,9 @@ func (tr *TestRunner) RunCapacityAblation(quick bool) ([]AblationResult, error) 
 }
 
 // RunCrossPatternComparison 运行三策略 × 三负载模式全量对比
+// 外层循环遍历 3 种负载模式，内层调用 RunAllStrategies 遍历 3 种策略
+// 共计 3 × 3 = 9 次独立运行，每次运行都输出单独的 CSV
+// 适合做全面的策略 × 场景正交对比分析
 func (tr *TestRunner) RunCrossPatternComparison(quick bool) ([]MetricsSummary, error) {
 	var allSummaries []MetricsSummary
 
@@ -314,7 +373,11 @@ func (tr *TestRunner) RunCrossPatternComparison(quick bool) ([]MetricsSummary, e
 	return allSummaries, nil
 }
 
-// RunFullAblation 运行完整的消融实验（Rajomon + 静态限流 + 容量，全负载模式）
+// RunFullAblation 运行完整的三阶段消融实验
+// Phase 1: Rajomon 参数消融（20+ 组 × 3 模式）
+// Phase 2: 静态限流参数消融（多组 × 3 模式）
+// Phase 3: 后端容量消融（3 策略 × 多组 × 3 模式）
+// 总运行次数可达 100+ 次，适合论文级的完整实验
 func (tr *TestRunner) RunFullAblation(quick bool) error {
 	fmt.Println("\n========== [Phase 1] Rajomon 参数消融（跨全部负载模式） ==========")
 	_, err := tr.RunRajomonAblation(quick)
@@ -337,7 +400,9 @@ func (tr *TestRunner) RunFullAblation(quick bool) error {
 	return nil
 }
 
-// printAblationTable 打印消融对照结果表格
+// printAblationTable 打印消融对照结果表格（终端输出）
+// 表格列：对照组名 | 负载模式 | 吞吐量 | 拒绝率 | 预算10/50/100成功率 | P95延迟
+// 用于在终端直观展示各对照组在不同预算层级下的公平性差异
 func printAblationTable(results []AblationResult) {
 	fmt.Printf("\n%s\n", strings.Repeat("=", 120))
 	fmt.Println("  消融对照结果汇总")

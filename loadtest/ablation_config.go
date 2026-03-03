@@ -1,26 +1,39 @@
 // ablation_config.go
-// 消融实验参数配置（Ablation Study Configuration）
+// ==================== 消融实验参数配置（Ablation Study Configuration） ====================
 //
-// 本文件集中管理所有消融对照组的参数定义，与 config.go 中的 AblationGroup 结构体配合使用。
-// 消融实验的目的是系统性地探索各参数维度对治理效果的影响。
+// 【文件在整体测试流程中的位置】
 //
-// Rajomon 参数维度：
-//   - PriceStrategy:    step（线性步进）/ expdecay（指数衰减）
-//   - PriceAggregation: maximal（短板效应）/ additive（累加）/ mean（平均）
-//   - PriceStep:        价格调整步长（控制涨价速度）
-//   - LatencyThreshold: 排队延迟阈值（控制过载检测灵敏度）
-//   - PriceUpdateRate:  价格更新频率（控制定价反应速度）
-//   - BudgetDistribution: 均匀分布 / 极端贫富差距
+//	本文件是消融实验的"参数仓库"，集中定义了所有对照组的具体参数。
+//	它不包含任何执行逻辑，仅返回 []AblationGroup 切片供 runner.go 使用。
+//	调用链：main.go -mode=ablation → runner.go RunAblationStudy() → 本文件的各函数获取对照组列表
 //
-// 负载模式维度：
-//   - step:    阶梯式突发（warmup→low→medium→high→overload→recovery）
-//   - sine:    正弦波动（持续周期性变化）
-//   - poisson: 泊松到达（随机突发）
+// 【消融实验设计原则】
+//
+//	科学实验中的"控制变量法"：每个对照组只改变一个参数维度，其余保持默认。
+//	这样实验结果的差异可以归因于那唯一被改变的参数。
+//
+// 【Rajomon 参数维度编号规则】（便于在 CSV 和图表中快速定位）
+//
+//	A 组: PriceStrategy    — 价格策略 (step 线性步进 / expdecay 指数衰减)
+//	B 组: PriceAggregation — 聚合策略 (maximal 短板效应 / additive 累加 / mean 平均)
+//	C 组: PriceStep        — 价格调整步长 (控制涨价速度，值越大涨价越快)
+//	D 组: LatencyThreshold — 排队延迟阈值 (控制过载检测灵敏度，值越小越敏感)
+//	E 组: PriceUpdateRate  — 价格更新频率 (控制定价反应速度)
+//	F 组: BudgetDistribution — 预算分布 (均匀分布 / 极端贫富差距)
+//	X 组: Cross-dimensional — 跨维度组合 (探索参数间的交互效应)
+//
+// 【负载模式维度】
+//
+//	每个对照组会分别在三种负载模式下运行（共 N组 × 3模式 次测试）：
+//	- step:    阶梯式突发（warmup→low→medium→high→overload→recovery）
+//	- sine:    正弦波动（持续周期性变化）
+//	- poisson: 泊松到达（随机突发，模拟真实流量）
 package main
 
 import "time"
 
-// AllLoadPatterns 返回所有负载模式
+// AllLoadPatterns 返回所有负载模式的枚举列表
+// 供 runner.go 在"全模式消融"时遍历使用
 func AllLoadPatterns() []LoadPattern {
 	return []LoadPattern{PatternStep, PatternSine, PatternPoisson}
 }
@@ -39,6 +52,9 @@ func AllLoadPatterns() []LoadPattern {
 //   F 组: 预算分布 (Budget Distribution)
 //   X 组: 跨维度组合 (Cross-dimensional)
 
+// RajomonAblationGroups 返回 Rajomon 动态定价算法的全部消融对照组
+// 共包含 1 个基线 + 若干个单因素对照 + 若干个跨维度组合 = 约 20 个对照组
+// 每个对照组会在 runner.go 中被 ApplyTo() 到 DefaultTestConfig 上，生成独立的测试配置
 func RajomonAblationGroups() []AblationGroup {
 	return []AblationGroup{
 
@@ -233,6 +249,8 @@ func RajomonAblationGroups() []AblationGroup {
 }
 
 // ==================== 静态限流消融对照组 ====================
+// 通过调整 QPS 阈值和突发容量，观察传统限流策略在不同参数下的表现差异。
+// 用于与 Rajomon 的消融结果进行横向对比：静态限流能否通过调参达到类似效果？
 
 func StaticRateLimitAblationGroups() []AblationGroup {
 	return []AblationGroup{
@@ -264,6 +282,9 @@ func StaticRateLimitAblationGroups() []AblationGroup {
 }
 
 // ==================== 后端容量消融对照组 ====================
+// 改变后端服务器的最大并发容量（MaxServerConcurrency），
+// 观察三种策略在"小容量/标准/大容量"后端上的表现。
+// 核心问题：Rajomon 的优势是否随后端容量变化而改变？
 
 func CapacityAblationGroups() []AblationGroup {
 	return []AblationGroup{

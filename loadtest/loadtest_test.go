@@ -2,6 +2,15 @@
 // 基础负载测试 — Go Test 集成
 // 可通过 go test 运行，便于 CI/CD 集成和快速验证
 //
+// 本文件包含 5 个测试函数，覆盖不同场景：
+//   - TestQuickComparison       : 快速对比三种策略（~3分钟）
+//   - TestSingleStrategy        : 逐个测试每种策略 + 策略特定验证
+//   - TestStepLoadAllStrategies : 完整阶梯式负载测试（论文数据采集）
+//   - TestRajomonPriceDynamics  : 验证 Rajomon 动态定价机制
+//   - TestFairnessComparison    : 对比三种策略的公平性
+//
+// 所有测试均支持 -short 标志跳过，适合 CI 中只运行单元测试
+//
 // 运行方式：
 //
 //	cd loadtest
@@ -15,9 +24,11 @@ import (
 	"time"
 )
 
-// TestQuickComparison 快速对比三种策略
+// TestQuickComparison 快速对比三种策略（最常用的验证测试）
 // 使用较短的阶段时长，快速验证三种策略的行为差异
+// 流程：DefaultTestConfig → RunQuickTest → 内部调用 RunAllStrategies(PatternStep, 1)
 // 运行耗时约 3 分钟（3 策略 × ~55s），使用 -short 跳过
+// 验证点：每种策略都发送了请求（TotalRequests > 0）
 func TestQuickComparison(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过快速对比测试（使用 -short 标志），请单独运行: go test -v -run TestQuickComparison -timeout 10m")
@@ -48,7 +59,12 @@ func TestQuickComparison(t *testing.T) {
 	}
 }
 
-// TestSingleStrategy 逐个测试每种策略
+// TestSingleStrategy 逐个测试每种策略（用 t.Run 子测试拆分）
+// 可通过 -run TestSingleStrategy/rajomon 单独运行某个策略
+// 每种策略有特定的验证逻辑：
+//   - no_governance   : 记录错误率和拒绝率（过载时应有错误）
+//   - static_rate_limit: 检查高负载下的拒绝率
+//   - rajomon          : 验证动态定价生效 + 公平性（高预算≥低预算成功率）
 func TestSingleStrategy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过单策略测试（-short 模式）")
@@ -115,8 +131,10 @@ func TestSingleStrategy(t *testing.T) {
 	}
 }
 
-// TestStepLoadAllStrategies 完整阶梯式负载测试（论文数据采集）
-// 运行耗时较长，适合在数据采集时使用
+// TestStepLoadAllStrategies 完整阶梯式负载测试（论文数据采集用）
+// 使用 DefaultTestConfig 的完整阶段配置（每阶段 20~30s）
+// 三种策略各运行 1 次，耗时较长（~10 分钟）
+// 验证点：至少收集到 3 个策略的结果
 func TestStepLoadAllStrategies(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过完整负载测试（使用 -short 标志）")
@@ -142,8 +160,12 @@ func TestStepLoadAllStrategies(t *testing.T) {
 	}
 }
 
-// TestRajomonPriceDynamics 验证 Rajomon 动态定价机制
-// 确认价格随负载变化（核心功能验证）
+// TestRajomonPriceDynamics 验证 Rajomon 动态定价机制（核心功能验证）
+// 使用简化的 4 阶段（warmup → low → overload → recovery）
+// 重点验证：
+//  1. 过载阶段应有拒绝（价格上升导致低预算客户被拒）
+//  2. 恢复阶段拒绝率应下降（价格回落）
+//  3. 高预算用户成功率应高于低预算用户（公平性）
 func TestRajomonPriceDynamics(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过 Rajomon 动态定价测试（-short 模式）")
@@ -192,7 +214,10 @@ func TestRajomonPriceDynamics(t *testing.T) {
 	}
 }
 
-// TestFairnessComparison 对比三种策略的公平性
+// TestFairnessComparison 对比三种策略的公平性（论文关键实验）
+// 使用 warmup → overload(15s, 100并发) → recovery 的简化场景
+// 对每种策略输出预算 10/50/100 三个典型组的成功率
+// 期望结果：Rajomon 应展现明显的预算梯度（预算越高成功率越高）
 func TestFairnessComparison(t *testing.T) {
 	if testing.Short() {
 		t.Skip("跳过公平性对比测试（使用 -short 标志）")
