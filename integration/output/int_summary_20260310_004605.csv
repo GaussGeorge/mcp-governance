@@ -1,0 +1,4 @@
+﻿strategy,pattern,run_index,total_requests,success_count,error_count,rejected_count,throughput_rps,error_rate,rejection_rate,avg_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,max_latency_ms,latency_stddev_ms,budget_10_success_rate,budget_50_success_rate,budget_100_success_rate,duration_seconds
+no_governance,step,1,17055,15120,0,1935,271.36,0.0000,0.1135,92.46,59.00,457.00,465.00,485.00,116.95,0.8906,0.8849,0.8824,55.72
+static_rate_limit,step,1,19468,1672,0,17796,30.17,0.0000,0.9141,5.48,0.00,60.00,67.00,83.00,17.10,0.0915,0.0825,0.0817,55.41
+rajomon,step,1,22617,15279,0,7338,274.79,0.0000,0.3244,45.16,56.00,69.00,248.52,494.00,48.68,0.5544,0.5835,0.9913,55.60
